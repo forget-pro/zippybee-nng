@@ -1,155 +1,212 @@
 use napi::{
   bindgen_prelude::*,
-  threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode},
+  threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
+use nng::{options::Options,Socket, Protocol, Error as NngError};
 use napi_derive::napi;
-use std::{
-  sync::mpsc::{self, Sender},
-  thread,
-  time::Duration,
-};
+use core::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use serde_json::json;
 
-use nng::{
-  options::{Options, RecvTimeout, SendTimeout},
-  Protocol,
-};
-
-#[napi(object)]
-#[derive(Clone, Debug, Default)]
-pub struct SocketOptions {
-  pub recv_timeout: Option<i32>,
-  pub send_timeout: Option<i32>,
-}
-
-#[napi()]
-#[derive(Clone, Debug)]
-pub struct Socket {
-  client: nng::Socket,
-  connected: bool,
-  pub options: SocketOptions,
-}
-
-/**
- * A simple Pair1 nanomsg protocol binding
- */
 #[napi]
-impl Socket {
+pub struct SocketWrapper {
+  socket: Option<Socket>,
+  url: Option<String>,
+  receiving: Arc<AtomicBool>,
+  recv_thread_handle: Option<std::thread::JoinHandle<()>>,
+  is_closed_by_user: Arc<AtomicBool>,
+}
+
+#[napi]
+impl SocketWrapper {
   #[napi(constructor)]
-  pub fn new(options: Option<SocketOptions>) -> Result<Self> {
-    let opt = options.unwrap_or_default();
-    Ok(Socket {
-      client: Self::create_client(&opt)?,
-      connected: false,
-      options: opt,
-    })
-  }
-
-  pub fn create_client(opt: &SocketOptions) -> Result<nng::Socket> {
-    nng::Socket::new(Protocol::Pair1)
-      .map(|client| {
-        let _ = client.set_opt::<RecvTimeout>(Some(Duration::from_millis(
-          opt
-            .recv_timeout
-            .and_then(|i| i.try_into().ok())
-            .unwrap_or(5000),
-        )));
-        let _ = client.set_opt::<SendTimeout>(Some(Duration::from_millis(
-          opt
-            .send_timeout
-            .and_then(|i| i.try_into().ok())
-            .unwrap_or(5000),
-        )));
-        client
-      })
-      .map_err(|e| Error::from_reason(format!("Initiate socket failed: {}", e)))
-  }
-
-  #[napi]
-  pub fn connect(&mut self, url: String) -> Result<()> {
-    let ret = self
-      .client
-      .dial(&url)
-      .map_err(|e| Error::from_reason(format!("Connect {} failed: {}", url, e)));
-    self.connected = ret.is_ok();
-    return ret;
-  }
-
-  #[napi]
-  pub fn send(&self, req: Buffer) -> Result<Buffer> {
-    let msg = nng::Message::from(&req[..]);
-    self
-      .client
-      .send(msg)
-      .map_err(|(_, e)| Error::from_reason(format!("Send rpc failed: {}", e)))?;
-    self
-      .client
-      .recv()
-      .map(|msg| msg.as_slice().into())
-      .map_err(|e| Error::from_reason(format!("Recv rpc failed: {}", e)))
-  }
-
-  #[napi]
-  pub fn close(&mut self) {
-    self.client.close();
-    self.connected = false;
-  }
-
-  #[napi]
-  pub fn connected(&self) -> bool {
-    self.connected
-  }
-
-  #[napi(ts_args_type = "callback: (err: null | Error, bytes: Buffer) => void")]
-  pub fn recv_message(
-    url: String,
-    options: Option<SocketOptions>,
-    callback: ThreadsafeFunction<Buffer, ErrorStrategy::CalleeHandled>,
-  ) -> Result<MessageRecvDisposable> {
-    let client = Self::create_client(&options.unwrap_or_default())?;
-    client
-      .dial(&url)
-      .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to connect: {}", e)))?;
-    let (tx, rx) = mpsc::channel::<()>();
-    thread::spawn(move || loop {
-      if let Ok(_) = rx.try_recv() {
-        client.close();
-        break;
+  pub fn new() -> Self {
+      SocketWrapper {
+          socket: None,
+          url: None,
+          receiving: Arc::new(AtomicBool::new(false)),
+          recv_thread_handle: None,
+          is_closed_by_user: Arc::new(AtomicBool::new(false)),
       }
-      match client.recv() {
-        Ok(msg) => {
-          callback.clone().call(
-            Ok(msg.as_slice().into()),
-            ThreadsafeFunctionCallMode::NonBlocking,
-          );
-        }
-        Err(e) => {
-          if let nng::Error::Closed = e {
-            return;
+  }
+
+  #[napi]
+  pub fn connect(
+      &mut self,
+      protocol: ProtocolType,
+      url: String,
+      recv_timeout: u32,
+      send_timeout: u32,
+  ) -> Result<bool> {
+      let socket = Socket::new(protocol.into()).map_err(|err| {
+          napi::Error::new(napi::Status::GenericFailure, format!("Socket creation failed: {:?}", err))
+      })?;
+
+      let recv_timeout_duration = if recv_timeout == 0 {
+          None
+      } else {
+          Some(Duration::from_millis(recv_timeout as u64))
+      };
+
+      let send_timeout_duration = if send_timeout == 0 {
+          None
+      } else {
+          Some(Duration::from_millis(send_timeout as u64))
+      };
+
+      if let Some(timeout) = recv_timeout_duration {
+          socket.set_opt::<nng::options::RecvTimeout>(Some(timeout))
+              .map_err(|err| napi::Error::new(napi::Status::GenericFailure, format!("Failed to set receive timeout: {:?}", err)))?;
+      }
+
+      if let Some(timeout) = send_timeout_duration {
+          socket.set_opt::<nng::options::SendTimeout>(Some(timeout))
+              .map_err(|err| napi::Error::new(napi::Status::GenericFailure, format!("Failed to set send timeout: {:?}", err)))?;
+      }
+
+      socket.dial(&url).map_err(|err| {
+          napi::Error::new(napi::Status::GenericFailure, format!("Connection failed: {:?}", err))
+      })?;
+
+      self.socket = Some(socket);
+      self.url = Some(url);
+      Ok(true)
+  }
+
+  #[napi]
+  pub fn send(&self, message: Buffer) -> Result<Buffer> {
+      if let Some(socket) = &self.socket {
+          let msg = nng::Message::from(&message[..]);
+
+          socket.send(msg).map_err(|(_, e)| {
+              napi::Error::new(napi::Status::GenericFailure, format!("Send error: {:?}", e))
+          })?;
+
+          let response = socket.recv().map_err(|e| {
+              match e {
+                  NngError::TimedOut => napi::Error::new(napi::Status::GenericFailure, "Receive timeout".to_string()),
+                  _ => napi::Error::new(napi::Status::GenericFailure, format!("Receive error: {:?}", e)),
+              }
+          })?;
+
+          Ok(response.as_slice().into())
+      } else {
+          Err(napi::Error::new(napi::Status::GenericFailure, "Socket not connected".to_string()))
+      }
+  }
+
+  #[napi]
+  pub fn recv(&mut self, callback: ThreadsafeFunction<Buffer>) -> Result<()> {
+      if self.recv_thread_handle.is_some() {
+          return Err(napi::Error::new(
+              napi::Status::GenericFailure,
+              "Receive thread already running.".to_string(),
+          ));
+      }
+
+      let socket = self.socket.clone();
+      let receiving = self.receiving.clone();
+      let is_closed_by_user = self.is_closed_by_user.clone();
+
+      let handle = std::thread::spawn(move || {
+          if let Some(socket) = socket {
+              receiving.store(true, Ordering::SeqCst);
+              loop {
+                  if !receiving.load(Ordering::SeqCst) {
+                      break;
+                  }
+                  match socket.recv() {
+                      Ok(message) => {
+                          let buffer = message.as_slice().into();
+                          let _ = callback.call(Ok(buffer), ThreadsafeFunctionCallMode::NonBlocking);
+                      }
+                      Err(NngError::TimedOut) => {
+                          eprintln!("Receive timed out.");
+                      }
+                      Err(nng::Error::Closed) => {
+                          // If socket was closed, check if it was closed by the user
+                          if is_closed_by_user.load(Ordering::SeqCst) {
+                              return;
+                          } else {
+                              eprintln!("Socket was closed unexpectedly.");
+                          }
+                          break;
+                      }
+                      Err(e) => {
+                          eprintln!("Error receiving message: {:?}", e);
+                      }
+                  }
+              }
           }
-        }
+      });
+
+      self.recv_thread_handle = Some(handle);
+      Ok(())
+  }
+
+  #[napi]
+  pub fn close(&mut self) -> Result<String> {
+      if let Some(socket) = self.socket.take() {
+          self.receiving.store(false, Ordering::SeqCst); // 发送信号停止接收线程
+          self.is_closed_by_user.store(true, Ordering::SeqCst); //设置主动关闭状态
+          socket.close(); // 尝试关闭 socket，注意这里返回的是 ()，没有错误处理
+
+          if let Some(url) = self.url.take() { // 获取关联的 URL
+              let result = json!({
+                  "code": 0,
+                  "url": url
+              });
+              return Ok(result.to_string()); // 返回成功的 JSON 字符串
+          } else {
+              let result = json!({
+                  "code": 1,
+                  "message": "未找到关联的 URL"
+              });
+              return Ok(result.to_string()); // 返回错误信息的 JSON 字符串
+          }
+      } else {
+          let result = json!({
+              "code": 1,
+              "message": "Socket 已关闭或未连接"
+          });
+          return Ok(result.to_string()); // 返回错误信息的 JSON 字符串
       }
-    });
-    return Ok(MessageRecvDisposable { closed: false, tx });
+  }
+
+  #[napi]
+  pub fn is_connect(&self) -> bool {
+      self.socket.is_some()
   }
 }
 
 #[napi]
-pub struct MessageRecvDisposable {
-  closed: bool,
-  tx: Sender<()>,
+pub enum ProtocolType {
+  Pair0,
+  Pair1,
+  Pub0,
+  Sub0,
+  Req0,
+  Rep0,
+  Surveyor0,
+  Push0,
+  Pull0,
+  Bus0,
 }
 
-#[napi]
-impl MessageRecvDisposable {
-  #[napi]
-  pub fn dispose(&mut self) -> Result<()> {
-    if self.closed == false {
-      self
-        .tx
-        .send(())
-        .map_err(|e| Error::from_reason(format!("Failed to stop msg channle: {}", e)))?;
-      self.closed = true;
-    }
-    Ok(())
+impl From<ProtocolType> for Protocol {
+  fn from(protocol_type: ProtocolType) -> Self {
+      match protocol_type {
+          ProtocolType::Pair0 => Protocol::Pair0,
+          ProtocolType::Pair1 => Protocol::Pair1,
+          ProtocolType::Pub0 => Protocol::Pub0,
+          ProtocolType::Sub0 => Protocol::Sub0,
+          ProtocolType::Req0 => Protocol::Req0,
+          ProtocolType::Rep0 => Protocol::Rep0,
+          ProtocolType::Surveyor0 => Protocol::Surveyor0,
+          ProtocolType::Push0 => Protocol::Push0,
+          ProtocolType::Pull0 => Protocol::Pull0,
+          ProtocolType::Bus0 => Protocol::Bus0,
+      }
   }
 }
