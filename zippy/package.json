@@ -1,0 +1,13 @@
+{
+  "name": "@zippybee/nng",
+  "version": "1.1.10",
+  "description": "rustnng nodejs sdk",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
