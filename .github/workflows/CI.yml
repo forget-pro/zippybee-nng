@@ -208,6 +208,7 @@ jobs:
           name: bindings-universal-apple-darwin
           path: ${{ env.APP_NAME }}.*.node
           if-no-files-found: error
+
 publish:
   name: Publish
   runs-on: ubuntu-latest
@@ -217,27 +218,20 @@ publish:
     - universal-macOS
   steps:
     - uses: actions/checkout@v4
-
     - name: Setup node
       uses: actions/setup-node@v4
       with:
         node-version: 20
         cache: npm
-
     - name: Install dependencies
       run: npm install
-
-    # 下载所有工件
     - name: Download all artifacts
       uses: actions/download-artifact@v3
       with:
         path: artifacts
-
-    # 执行 npm run artifacts 以处理 NAPI 相关工件
-    - name: Run NAPI artifacts
+    - name: Move artifacts
       run: npm run artifacts
 
-    # 将所有下载的 artifacts 和根目录下的 index.js 和 index.d.ts 移动到 zippy 目录
     - name: Move artifacts and index files
       run: |
         mkdir -p zippy
@@ -245,26 +239,22 @@ publish:
         mv index.js index.d.ts zippy/  # 将 index.js 和 index.d.ts 移动到 zippy 目录
       shell: bash
 
-    # 列出 zippy 目录下的所有文件以确认内容是否正确
-    - name: List packages in zippy directory
-      run: ls -R ./zippy # 确认 zippy 目录中的内容
+    - name: List packages
+      run: ls -R ./zippy
       shell: bash
-
-    # 暂时跳过发布，确保可以手动检查文件
-    # - name: Publish
-    #   run: |
-    #     npm config set provenance true
-    #     if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$";
-    #     then
-    #       echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-    #       npm publish --access public
-    #     elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
-    #     then
-    #       echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-    #       npm publish --tag next --access public
-    #     else
-    #       echo "Not a release, skipping publish"
-    #     fi
-    #   env:
-    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    #     NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      run: |
+        npm config set provenance true
+        if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$";
+        then
+          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+          npm publish --access public
+        elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
+        then
+          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+          npm publish --tag next --access public
+        else
+          echo "Not a release, skipping publish"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
