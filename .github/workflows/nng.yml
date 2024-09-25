@@ -30,24 +30,22 @@ jobs:
             build: |
               yarn build --target x86_64-apple-darwin
               strip -x *.node
-
-           - host: macos-latest
-            target: aarch64-apple-darwin
-            build: |
-              yarn build --target aarch64-apple-darwin
-              strip -x *.node
-
           - host: windows-latest
             build: yarn build
             target: x86_64-pc-windows-msvc
-
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: |-
               set -e &&
               yarn build --target x86_64-unknown-linux-gnu &&
+              mv index.js index.d.ts ./zippy/  # 移动生成的文件
               strip *.node
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: |
+              yarn build --target aarch64-apple-darwin
+              strip -x *.node
 
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
@@ -222,6 +220,9 @@ jobs:
 
       - name: List artifacts directory after extraction
         run: ls -R ./artifacts # 确认解压后的文件
+
+      - name: List Zippy
+        run: ls -R ./zippy # 列出 zippy 目录中的文件以确认
 
       - name: Combine binaries
         run: yarn universal
