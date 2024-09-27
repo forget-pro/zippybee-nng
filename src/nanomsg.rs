@@ -2,7 +2,8 @@ use napi::{
   bindgen_prelude::*,
   threadsafe_function::{ ThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
-use nng::{Socket, Protocol, Error as NngError};
+use nng::{options::Options,Socket, Protocol, Error as NngError};
+use core::time::Duration;
 use napi_derive::napi;
 use std::{
   sync::{mpsc::{self, Sender}, Arc,  atomic::{AtomicBool, Ordering}},
@@ -30,14 +31,45 @@ impl SocketWrapper {
   }
 
   #[napi]
-  pub fn connect(&mut self, protocol: ProtocolType, url: String) -> Result<()> {
-      let socket = Socket::new(protocol.into())
-          .map_err(|err| napi::Error::from(NngErrorWrapper(err)))?;
-      socket.dial(&url)
-          .map_err(|err| napi::Error::from(NngErrorWrapper(err)))?;
-      self.socket = Some(socket);
-      Ok(())
-  }
+  pub fn connect(
+    &mut self,
+    protocol: ProtocolType,
+    url: String,
+    recv_timeout: u32,
+    send_timeout: u32,
+) -> Result<bool> {
+    let socket = Socket::new(protocol.into()).map_err(|err| {
+        napi::Error::new(napi::Status::GenericFailure, format!("Socket creation failed: {:?}", err))
+    })?;
+
+    let recv_timeout_duration = if recv_timeout == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(recv_timeout as u64))
+    };
+
+    let send_timeout_duration = if send_timeout == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(send_timeout as u64))
+    };
+
+    if let Some(timeout) = recv_timeout_duration {
+        socket.set_opt::<nng::options::RecvTimeout>(Some(timeout))
+            .map_err(|err| napi::Error::new(napi::Status::GenericFailure, format!("Failed to set receive timeout: {:?}", err)))?;
+    }
+
+    if let Some(timeout) = send_timeout_duration {
+        socket.set_opt::<nng::options::SendTimeout>(Some(timeout))
+            .map_err(|err| napi::Error::new(napi::Status::GenericFailure, format!("Failed to set send timeout: {:?}", err)))?;
+    }
+
+    socket.dial(&url).map_err(|err| {
+        napi::Error::new(napi::Status::GenericFailure, format!("Connection failed: {:?}", err))
+    })?;
+
+    Ok(true)
+}
 
   #[napi]
   pub fn send(&self, message: Buffer) -> Result<Buffer> {
