@@ -1,6 +1,6 @@
 {
   "name": "@zippybee/nng",
-  "version": "1.1.13",
+  "version": "1.1.14",
   "description": "rustnng nodejs sdk",
   "main": "index.js",
   "types": "index.d.ts",
