@@ -281,8 +281,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { SocketWrapper, ProtocolType, MessageRecvDisposable } = nativeBinding
+const { Socket, MessageRecvDisposable } = nativeBinding
 
-module.exports.SocketWrapper = SocketWrapper
-module.exports.ProtocolType = ProtocolType
+module.exports.Socket = Socket
 module.exports.MessageRecvDisposable = MessageRecvDisposable
