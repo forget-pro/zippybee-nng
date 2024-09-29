@@ -3,6 +3,8 @@ use napi::{
     threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode},
   };
   use napi_derive::napi;
+  use lz4::block::{compress};
+  use lz4::block::CompressionMode;
   use std::{
     sync::mpsc::{self, Sender},
     thread,
@@ -153,3 +155,16 @@ use napi::{
       Ok(())
     }
   }
+
+  #[napi]
+  pub fn lz4_compress(input: Buffer) -> Result<Buffer> {
+      // 压缩输入缓冲区，第三个参数设置为 false 以不预置大小
+      match compress(&input, Some(CompressionMode::DEFAULT), false) {
+          Ok(compressed) => Ok(Buffer::from(compressed)),
+          Err(e) => Err(Error::new(
+              Status::GenericFailure,
+              format!("Compression failed: {}", e),
+          )),
+      }
+  }
+

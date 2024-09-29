@@ -281,7 +281,8 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Socket, MessageRecvDisposable } = nativeBinding
+const { Socket, MessageRecvDisposable, lz4Compress } = nativeBinding
 
 module.exports.Socket = Socket
 module.exports.MessageRecvDisposable = MessageRecvDisposable
+module.exports.lz4Compress = lz4Compress
