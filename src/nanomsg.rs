@@ -281,9 +281,9 @@ impl MessageRecvDisposable {
   #[napi]
   pub fn dispose(&mut self) -> Result<()> {
       if !self.closed {
-          self.tx.send(()).map_err(|e| {
-              Error::from_reason(format!("Failed to stop msg channel: {}", e))
-          })?;
+          // 尝试发送停止信号，如果失败也不算错误
+          // 因为线程可能已经结束了（比如连接失败的情况）
+          let _ = self.tx.send(());
           self.closed = true;
           self.is_connected.store(false, Ordering::Relaxed);
       }

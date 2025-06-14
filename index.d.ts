@@ -19,4 +19,6 @@ export class Socket {
 }
 export class MessageRecvDisposable {
   dispose(): void
+  isConnected(): boolean
+  isDisposed(): boolean
 }
