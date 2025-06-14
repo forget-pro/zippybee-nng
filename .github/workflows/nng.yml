@@ -1,4 +1,4 @@
-name: CI
+name: NNG
 env:
   DEBUG: napi:*
   APP_NAME: nng
