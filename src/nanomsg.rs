@@ -6,7 +6,7 @@ use napi_derive::napi;
 use lz4::block::{compress};
 use lz4::block::CompressionMode;
 use std::{
-  sync::{Arc, Mutex, mpsc::{self, Sender}},
+  sync::{Arc, Mutex, mpsc::{self, Sender}, atomic::{AtomicBool, Ordering}},
   thread,
   time::Duration,
 };
@@ -104,11 +104,13 @@ impl Socket {
       let callback = Arc::new(callback);
       let url = Arc::new(url);
       let options = Arc::new(options);
+      let is_connected = Arc::new(AtomicBool::new(false));
 
       let client_clone = Arc::clone(&client);
       let callback_clone = Arc::clone(&callback);
       let url_clone = Arc::clone(&url);
       let options_clone = Arc::clone(&options);
+      let is_connected_clone = Arc::clone(&is_connected);
 
       thread::spawn(move || {
           let mut retry_count = 0;
@@ -123,11 +125,15 @@ impl Socket {
               return;
           }
 
+          // 标记为已连接
+          is_connected_clone.store(true, Ordering::Relaxed);
+
           loop {
               // 检查是否主动关闭
               if rx.try_recv().is_ok() {
                   let client = client_clone.lock().unwrap();
                   client.close();
+                  is_connected_clone.store(false, Ordering::Relaxed);
                   println!("连接已主动关闭");
                   break;
               }
@@ -136,6 +142,8 @@ impl Socket {
               match client.recv() {
                   Ok(msg) => {
                       retry_count = 0; // 重置重试计数
+                      // 确保连接状态为真（可能刚重连成功）
+                      is_connected_clone.store(true, Ordering::Relaxed);
                       callback.call(
                           Ok(msg.as_slice().into()),
                           ThreadsafeFunctionCallMode::NonBlocking,
@@ -143,6 +151,7 @@ impl Socket {
                   }
                   Err(nng::Error::Closed) => {
                       drop(client); // 释放锁
+                      is_connected_clone.store(false, Ordering::Relaxed);
                       
                       println!("连接意外关闭，原因: 远程服务器主动关闭连接");
                       
@@ -162,6 +171,7 @@ impl Socket {
                                       continue;
                                   }
                                   println!("重连成功");
+                                  is_connected_clone.store(true, Ordering::Relaxed);
                               }
                               Err(e) => {
                                   println!("创建新客户端失败: {}", e);
@@ -170,6 +180,7 @@ impl Socket {
                           }
                       } else {
                           println!("达到最大重试次数，放弃重连");
+                          is_connected_clone.store(false, Ordering::Relaxed);
                           callback.call(
                               Err(Error::new(Status::GenericFailure, "连接断开，重试失败".to_string())),
                               ThreadsafeFunctionCallMode::NonBlocking,
@@ -183,6 +194,7 @@ impl Socket {
                   }
                   Err(e) => {
                       drop(client); // 释放锁
+                      is_connected_clone.store(false, Ordering::Relaxed);
                       
                       let error_msg = Self::translate_error(&e);
                       println!("接收消息时发生错误: {}", error_msg);
@@ -203,6 +215,7 @@ impl Socket {
                                       continue;
                                   }
                                   println!("重连成功");
+                                  is_connected_clone.store(true, Ordering::Relaxed);
                               }
                               Err(e) => {
                                   println!("创建新客户端失败: {}", e);
@@ -211,6 +224,7 @@ impl Socket {
                           }
                       } else {
                           println!("达到最大重试次数，放弃重连");
+                          is_connected_clone.store(false, Ordering::Relaxed);
                           callback.call(
                               Err(Error::new(Status::GenericFailure, format!("连接错误: {}", error_msg))),
                               ThreadsafeFunctionCallMode::NonBlocking,
@@ -222,7 +236,11 @@ impl Socket {
           }
       });
 
-      Ok(MessageRecvDisposable { closed: false, tx })
+      Ok(MessageRecvDisposable { 
+          closed: false, 
+          tx, 
+          is_connected 
+      })
   }
 
   // 建立连接的辅助方法
@@ -255,6 +273,7 @@ impl Socket {
 pub struct MessageRecvDisposable {
   closed: bool,
   tx: Sender<()>,
+  is_connected: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -266,8 +285,19 @@ impl MessageRecvDisposable {
               Error::from_reason(format!("Failed to stop msg channel: {}", e))
           })?;
           self.closed = true;
+          self.is_connected.store(false, Ordering::Relaxed);
       }
       Ok(())
+  }
+
+  #[napi]
+  pub fn is_connected(&self) -> bool {
+      self.is_connected.load(Ordering::Relaxed)
+  }
+
+  #[napi]
+  pub fn is_disposed(&self) -> bool {
+      self.closed
   }
 }
 
