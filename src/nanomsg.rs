@@ -98,50 +98,156 @@ impl Socket {
       options: Option<SocketOptions>,
       callback: ThreadsafeFunction<Buffer, ErrorStrategy::CalleeHandled>,
   ) -> Result<MessageRecvDisposable> {
-      let client = Arc::new(Mutex::new(Self::create_client(&options.unwrap_or_default())?));
+      let options = options.unwrap_or_default();
+      let client = Arc::new(Mutex::new(Self::create_client(&options)?));
       let (tx, rx) = mpsc::channel::<()>();
-      let callback = Arc::new(callback); // 只克隆一次，减少多余的 `clone()`
+      let callback = Arc::new(callback);
+      let url = Arc::new(url);
+      let options = Arc::new(options);
 
       let client_clone = Arc::clone(&client);
       let callback_clone = Arc::clone(&callback);
+      let url_clone = Arc::clone(&url);
+      let options_clone = Arc::clone(&options);
 
       thread::spawn(move || {
-          let client = client_clone.lock().unwrap();
-          if let Err(e) = client.dial(&url) {
+          let mut retry_count = 0;
+          const MAX_RETRIES: u32 = 3;
+
+          // 初始连接
+          if let Err(e) = Self::establish_connection(&client_clone, &url_clone) {
               callback_clone.call(
-                  Err(Error::new(Status::GenericFailure, format!("Failed to connect: {}", e))),
+                  Err(Error::new(Status::GenericFailure, format!("初始连接失败: {}", e))),
                   ThreadsafeFunctionCallMode::NonBlocking,
               );
               return;
           }
 
           loop {
+              // 检查是否主动关闭
               if rx.try_recv().is_ok() {
+                  let client = client_clone.lock().unwrap();
                   client.close();
+                  println!("连接已主动关闭");
                   break;
               }
 
+              let client = client_clone.lock().unwrap();
               match client.recv() {
                   Ok(msg) => {
+                      retry_count = 0; // 重置重试计数
                       callback.call(
                           Ok(msg.as_slice().into()),
                           ThreadsafeFunctionCallMode::NonBlocking,
                       );
                   }
                   Err(nng::Error::Closed) => {
-                      let disconnect_msg = b"DISCONNECTED".to_vec();
-                      callback.call(
-                          Ok(disconnect_msg.into()),
-                          ThreadsafeFunctionCallMode::NonBlocking,
-                      );
-                      break;
+                      drop(client); // 释放锁
+                      
+                      println!("连接意外关闭，原因: 远程服务器主动关闭连接");
+                      
+                      if retry_count < MAX_RETRIES {
+                          retry_count += 1;
+                          println!("尝试重新连接 ({}/{})", retry_count, MAX_RETRIES);
+                          
+                          // 等待一段时间再重连
+                          thread::sleep(Duration::from_millis(1000 * retry_count as u64));
+                          
+                          // 创建新的客户端并重新连接
+                          match Self::create_client(&options_clone) {
+                              Ok(new_client) => {
+                                  *client_clone.lock().unwrap() = new_client;
+                                  if let Err(e) = Self::establish_connection(&client_clone, &url_clone) {
+                                      println!("重连失败: {}", e);
+                                      continue;
+                                  }
+                                  println!("重连成功");
+                              }
+                              Err(e) => {
+                                  println!("创建新客户端失败: {}", e);
+                                  continue;
+                              }
+                          }
+                      } else {
+                          println!("达到最大重试次数，放弃重连");
+                          callback.call(
+                              Err(Error::new(Status::GenericFailure, "连接断开，重试失败".to_string())),
+                              ThreadsafeFunctionCallMode::NonBlocking,
+                          );
+                          break;
+                      }
                   }
-                  _ => {}
+                  Err(nng::Error::TimedOut) => {
+                      // 超时不算错误，继续循环
+                      continue;
+                  }
+                  Err(e) => {
+                      drop(client); // 释放锁
+                      
+                      let error_msg = Self::translate_error(&e);
+                      println!("接收消息时发生错误: {}", error_msg);
+                      
+                      if retry_count < MAX_RETRIES {
+                          retry_count += 1;
+                          println!("尝试重新连接 ({}/{})", retry_count, MAX_RETRIES);
+                          
+                          // 等待一段时间再重连
+                          thread::sleep(Duration::from_millis(1000 * retry_count as u64));
+                          
+                          // 创建新的客户端并重新连接
+                          match Self::create_client(&options_clone) {
+                              Ok(new_client) => {
+                                  *client_clone.lock().unwrap() = new_client;
+                                  if let Err(e) = Self::establish_connection(&client_clone, &url_clone) {
+                                      println!("重连失败: {}", e);
+                                      continue;
+                                  }
+                                  println!("重连成功");
+                              }
+                              Err(e) => {
+                                  println!("创建新客户端失败: {}", e);
+                                  continue;
+                              }
+                          }
+                      } else {
+                          println!("达到最大重试次数，放弃重连");
+                          callback.call(
+                              Err(Error::new(Status::GenericFailure, format!("连接错误: {}", error_msg))),
+                              ThreadsafeFunctionCallMode::NonBlocking,
+                          );
+                          break;
+                      }
+                  }
               }
           }
       });
 
       Ok(MessageRecvDisposable { closed: false, tx })
+  }
+
+  // 建立连接的辅助方法
+  fn establish_connection(client: &Arc<Mutex<nng::Socket>>, url: &str) -> Result<()> {
+      let client = client.lock().unwrap();
+      client.dial(url)
+          .map_err(|e| Error::from_reason(format!("连接失败: {}", e)))
+  }
+
+  // 将nng错误翻译为中文
+  fn translate_error(error: &nng::Error) -> String {
+      match error {
+          nng::Error::Closed => "连接已关闭".to_string(),
+          nng::Error::TimedOut => "操作超时".to_string(),
+          nng::Error::ConnectionRefused => "连接被拒绝".to_string(),
+          nng::Error::InvalidInput => "无效输入".to_string(),
+          nng::Error::AddressInUse => "地址已被使用".to_string(),
+          nng::Error::NotSupported => "操作不支持".to_string(),
+          nng::Error::AddressInvalid => "地址无效".to_string(),
+          nng::Error::MessageTooLarge => "消息过大".to_string(),
+          nng::Error::DestUnreachable => "目标不可达".to_string(),
+          nng::Error::ConnectionAborted => "连接被中止".to_string(),
+          nng::Error::ConnectionReset => "连接被重置".to_string(),
+          _ => format!("未知错误: {:?}", error),
+      }
   }
 }
 
