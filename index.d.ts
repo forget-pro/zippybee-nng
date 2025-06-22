@@ -15,10 +15,11 @@ export class Socket {
   send(req: Buffer): Buffer
   close(): void
   connected(): boolean
-  static recvMessage(callback: (err: null | Error, bytes: Buffer) => void): MessageRecvDisposable
+  static testConnection(url: string, options?: SocketOptions | undefined | null): boolean
+  static recvMessage(url: string, callback: (err: null | Error, bytes: Buffer) => void, options?: SocketOptions | undefined | null): MessageRecvDisposable
 }
 export class MessageRecvDisposable {
   dispose(): void
-  isConnected(): boolean
-  isDisposed(): boolean
+  isClosed(): boolean
+  isConnectionAlive(): boolean
 }
